@@ -1,0 +1,423 @@
+name: BlockVerse Android APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blockverse-android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-android:
+    name: Validate and build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GODOT_VERSION: 4.7.2
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Check out source
+        id: checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # checkout cleans untracked files by default.  Initializing this after
+      # checkout keeps the console log and report available on a failing run.
+      - name: Initialize build diagnostics
+        id: init_diagnostics
+        shell: bash
+        run: |
+          set -u
+          mkdir -p build/reports
+          {
+            echo "BlockVerse build console log"
+            echo "Started at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Runner: ${RUNNER_OS:-unknown} / ${RUNNER_ARCH:-unknown}"
+            echo "Repository: ${GITHUB_REPOSITORY:-unknown}"
+            echo
+          } > build-console.log
+          echo "Diagnostics initialized at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+      - name: Locate Godot project
+        id: locate_project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          echo '=== Repository files (top levels) ==='
+          find . -maxdepth 3 -not -path './.git/*' -not -path './.git' | sort | head -n 150
+          PROJECT_FILE="$(find . -maxdepth 3 -name project.godot -not -path './.git/*' -print -quit)"
+          if [[ -z "$PROJECT_FILE" ]]; then
+            # Fallback: the project was uploaded as a .zip -> extract it automatically.
+            while IFS= read -r Z; do
+              echo "No project.godot found; trying to extract $Z"
+              mkdir -p _unzipped_project
+              unzip -oq "$Z" -d _unzipped_project || true
+            done < <(find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' -not -path './_unzipped_project/*')
+            PROJECT_FILE="$(find ./_unzipped_project -maxdepth 4 -name project.godot -print -quit 2>/dev/null || true)"
+          fi
+          if [[ -z "$PROJECT_FILE" ]]; then
+            if find . -maxdepth 2 -iname '*.zip' -not -path './.git/*' | grep -q .; then
+              echo 'ERROR: A .zip file was uploaded to the repository, but GitHub does not extract ZIP files. Extract the ZIP on your device and upload the FILES inside it (project.godot, scenes/, scripts/ ...) instead of the .zip.' >&2
+            fi
+            echo 'ERROR: project.godot not found in the repository (looked 3 levels deep).' >&2
+            exit 1
+          fi
+          PROJECT_DIR="$(cd "$(dirname "$PROJECT_FILE")" && pwd)"
+          echo "Godot project directory: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/export_presets.cfg" || { echo "ERROR: export_presets.cfg is missing in $PROJECT_DIR (needed for Android export)." >&2; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        id: java_setup
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        id: android_setup
+        # v3 used obsolete command-line-tools download metadata and can fail with HTTP 404.
+        # v4 uses current Android command-line tools (22.0 / build 15859902).
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '15859902'
+          log-accepted-android-sdk-licenses: 'false'
+
+      - name: Install Android SDK packages
+        id: sdk_install
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          echo '=== Normalize Android command-line-tools path for Godot ==='
+          SDKMANAGER_PATH="$(command -v sdkmanager || true)"
+          test -n "$SDKMANAGER_PATH" || { echo 'ERROR: setup-android action did not put sdkmanager on PATH.' >&2; exit 1; }
+          SDKMANAGER_REAL="$(readlink -f "$SDKMANAGER_PATH")"
+          TOOLS_BIN="$(dirname "$SDKMANAGER_REAL")"
+          TOOLS_DIR="$(dirname "$TOOLS_BIN")"
+          case "$TOOLS_DIR" in
+            "$ANDROID_HOME"/cmdline-tools/*) ;;
+            *) echo "ERROR: sdkmanager is outside expected Android SDK directory: $SDKMANAGER_REAL" >&2; exit 1 ;;
+          esac
+          LATEST_DIR="$ANDROID_HOME/cmdline-tools/latest"
+          if [[ ! -e "$LATEST_DIR" || ! "$LATEST_DIR" -ef "$TOOLS_DIR" ]]; then
+            if [[ -e "$LATEST_DIR" || -L "$LATEST_DIR" ]]; then
+              mv "$LATEST_DIR" "$ANDROID_HOME/cmdline-tools/latest.backup-${GITHUB_RUN_ID:-local}"
+            fi
+            ln -s "$TOOLS_DIR" "$LATEST_DIR"
+          fi
+          test -x "$LATEST_DIR/bin/sdkmanager" || { echo "ERROR: Godot-compatible sdkmanager path is missing: $LATEST_DIR/bin/sdkmanager" >&2; exit 1; }
+          echo "sdkmanager: $SDKMANAGER_REAL"
+          echo "Godot SDK tools compatibility path: $LATEST_DIR"
+          echo '=== Java ==='
+          java -version
+          echo '=== Accept Android SDK licenses ==='
+          sdkmanager --sdk_root="$ANDROID_HOME" --licenses < <(yes) >/dev/null
+          echo '=== Install required SDK packages ==='
+          sdkmanager --sdk_root="$ANDROID_HOME" \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.1'
+          # The normal Godot Android template already contains its native
+          # libraries.  NDK and CMake are only needed for a custom Gradle
+          # template, so installing them here only adds failure points.
+          test -d "$ANDROID_HOME/platforms/android-35" || { echo 'ERROR: Android platform 35 was not installed.' >&2; exit 1; }
+          test -x "$ANDROID_HOME/build-tools/35.0.1/aapt" || { echo 'ERROR: Android build-tools 35.0.1 (aapt) were not installed.' >&2; exit 1; }
+          echo '=== Installed SDK packages ==='
+          sdkmanager --sdk_root="$ANDROID_HOME" --list_installed
+
+      - name: Download Godot 4.7.2 and matching export templates
+        id: godot_download
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          GODOT_ZIP="$RUNNER_TEMP/godot_linux.zip"
+          TEMPLATE_ZIP="$RUNNER_TEMP/godot_export_templates.tpz"
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+
+          echo '=== Download Godot Linux editor ==='
+          curl --fail --location --show-error --retry 4 --retry-delay 2 --retry-all-errors \
+            "https://downloads.godotengine.org/?flavor=stable&platform=linux.64&slug=linux.x86_64.zip&version=${GODOT_VERSION}" \
+            --output "$GODOT_ZIP"
+          unzip -tq "$GODOT_ZIP"
+          mkdir -p "$RUNNER_TEMP/godot"
+          unzip -oq "$GODOT_ZIP" -d "$RUNNER_TEMP/godot"
+          echo 'Files in downloaded Godot archive:'
+          find "$RUNNER_TEMP/godot" -type f -printf '%P (%s bytes)\n' | sort | head -n 50
+          # The binary is not always at the archive root, so locate it instead of guessing the path.
+          GODOT_EXE="$(find "$RUNNER_TEMP/godot" -type f -name 'Godot*linux*x86_64' ! -name '*.zip' ! -name '*console*' -print -quit)"
+          if [[ -z "$GODOT_EXE" ]]; then
+            GODOT_EXE="$(find "$RUNNER_TEMP/godot" -type f -iname 'godot*' ! -name '*.zip' ! -name '*.md' ! -name '*.txt' ! -name '*.so' -print -quit)"
+          fi
+          test -n "$GODOT_EXE" || { echo 'ERROR: Godot executable not found inside the downloaded archive.' >&2; exit 1; }
+          chmod +x "$GODOT_EXE"
+          echo "Godot executable located at: $GODOT_EXE"
+          echo "GODOT_EXE=$GODOT_EXE" >> "$GITHUB_ENV"
+          GODOT_ACTUAL_VERSION=$("$GODOT_EXE" --version)
+          echo "Godot executable reports: $GODOT_ACTUAL_VERSION"
+          [[ "$GODOT_ACTUAL_VERSION" == "${GODOT_VERSION}.stable"* ]] || {
+            echo "ERROR: expected Godot ${GODOT_VERSION}.stable but got ${GODOT_ACTUAL_VERSION}" >&2
+            exit 1
+          }
+
+          echo '=== Download matching export templates ==='
+          curl --fail --location --show-error --retry 4 --retry-delay 2 --retry-all-errors \
+            "https://downloads.godotengine.org/?flavor=stable&platform=templates&slug=export_templates.tpz&version=${GODOT_VERSION}" \
+            --output "$TEMPLATE_ZIP"
+          unzip -tq "$TEMPLATE_ZIP"
+          mkdir -p "$RUNNER_TEMP/godot_templates"
+          unzip -oq "$TEMPLATE_ZIP" -d "$RUNNER_TEMP/godot_templates"
+          echo 'Files in downloaded template archive:'
+          find "$RUNNER_TEMP/godot_templates" -maxdepth 3 -type f -printf '%P\n' | sort | head -n 100
+          test -d "$RUNNER_TEMP/godot_templates/templates" || {
+            echo 'ERROR: templates/ directory missing from Godot export-template archive.' >&2
+            exit 1
+          }
+          mkdir -p "$TEMPLATE_DIR"
+          cp -a "$RUNNER_TEMP/godot_templates/templates/." "$TEMPLATE_DIR/"
+          test -s "$TEMPLATE_DIR/android_debug.apk" || {
+            echo "ERROR: matching android_debug.apk template not found at $TEMPLATE_DIR" >&2
+            exit 1
+          }
+          echo "Installed matching export templates into $TEMPLATE_DIR"
+
+      - name: Configure Godot Android SDK paths
+        id: godot_config
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          mkdir -p "$HOME/.config/godot" "$HOME/.android"
+          echo '=== Create Android debug keystore (required for signed debug export) ==='
+          rm -f "$HOME/.android/debug.keystore"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          test -s "$HOME/.android/debug.keystore" || { echo 'ERROR: debug keystore was not created.' >&2; exit 1; }
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF_SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+          [resource]
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/debug_keystore = "$HOME/.android/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF_SETTINGS
+          cp "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.7.tres"
+          echo '=== Godot Android settings ==='
+          cat "$HOME/.config/godot/editor_settings-4.tres"
+          test -x "$JAVA_HOME/bin/java" || { echo "ERROR: Java not found at $JAVA_HOME/bin/java" >&2; exit 1; }
+          test -d "$ANDROID_HOME/platform-tools" || { echo "ERROR: Android platform-tools are missing under $ANDROID_HOME" >&2; exit 1; }
+          SDKMANAGER_PATH="$(command -v sdkmanager || true)"
+          test -n "$SDKMANAGER_PATH" || { echo "ERROR: sdkmanager is not on PATH. Android setup action may have failed to add command-line tools." >&2; exit 1; }
+          test -x "$SDKMANAGER_PATH" || { echo "ERROR: sdkmanager path is not executable: $SDKMANAGER_PATH" >&2; exit 1; }
+          echo "Using sdkmanager: $SDKMANAGER_PATH"
+          echo "Installed command-line tool directories:"
+          find "$ANDROID_HOME/cmdline-tools" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort || true
+
+      - name: Run static source validation
+        id: static_checks
+        # Non-blocking: reported as a warning, the APK is still built.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          if [[ -f "$PROJECT_DIR/tests/static_validate.py" ]]; then
+            (cd "$PROJECT_DIR" && python3 tests/static_validate.py)
+          else
+            echo "WARNING: tests/static_validate.py not found in $PROJECT_DIR - skipping static validation." >&2
+            exit 1
+          fi
+
+      - name: Import resources and validate project in Godot
+        id: godot_import
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          test -x "$GODOT_EXE" || { echo "ERROR: GODOT_EXE is not set or not executable: ${GODOT_EXE:-unset}" >&2; exit 1; }
+          timeout 600 "$GODOT_EXE" --headless --editor --path "$PROJECT_DIR" --import 2>&1 | tee godot-import.log
+          timeout 300 "$GODOT_EXE" --headless --path "$PROJECT_DIR" --editor --quit 2>&1 | tee godot-editor-check.log
+
+      - name: Run gameplay and data tests
+        id: gameplay_tests
+        # Non-blocking: a failing unit test is reported as a warning, but the APK is still built.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          if [[ ! -f "$PROJECT_DIR/tests/run_tests.gd" ]]; then
+            echo "WARNING: tests/run_tests.gd not found in $PROJECT_DIR - skipping gameplay tests." >&2
+            exit 1
+          fi
+          timeout 300 "$GODOT_EXE" --headless --path "$PROJECT_DIR" --script res://tests/run_tests.gd 2>&1 | tee godot-tests.log
+
+      - name: Export and validate Android ARM64 debug APK
+        id: apk_export
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee -a build-console.log) 2>&1
+          mkdir -p "$GITHUB_WORKSPACE/build/android"
+          APK="$GITHUB_WORKSPACE/build/android/BlockVerse-Realistic-debug.apk"
+
+          echo '=== Export APK ==='
+          timeout 900 "$GODOT_EXE" --headless --path "$PROJECT_DIR" --export-debug 'Android Debug' "$APK" 2>&1 | tee godot-export.log
+          test -s "$APK" || { echo "ERROR: APK not created: $APK" >&2; exit 1; }
+          echo '=== Validate APK archive ==='
+          unzip -t "$APK" | tee apk-files.log
+          unzip -Z1 "$APK" > apk-entry-list.txt
+          grep -q '^lib/arm64-v8a/' apk-entry-list.txt || {
+            echo 'ERROR: APK does not contain ARM64 native libraries.' >&2
+            exit 1
+          }
+
+          ANALYZER="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/apkanalyzer' -print -quit 2>/dev/null || true)"
+          AAPT="$ANDROID_HOME/build-tools/35.0.1/aapt"
+          if [[ -n "$ANALYZER" && -x "$ANALYZER" ]]; then
+            "$ANALYZER" manifest application-id "$APK" | tee apk-application-id.log
+            grep -q 'com.blockverse.realistic' apk-application-id.log
+          elif [[ -x "$AAPT" ]]; then
+            "$AAPT" dump badging "$APK" | tee apk-application-id.log
+            grep -q 'com.blockverse.realistic' apk-application-id.log
+          else
+            echo 'ERROR: Neither apkanalyzer nor aapt was found in the configured Android SDK.' >&2
+            exit 1
+          fi
+          echo "APK validation succeeded: $APK"
+
+      - name: Upload APK
+        id: apk_artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: BlockVerse-Realistic-Android-APK
+          path: ${{ github.workspace }}/build/android/BlockVerse-Realistic-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # Always make a readable report, even when checkout / SDK setup / download fails.
+      - name: Generate build report and failure hints
+        id: generate_report
+        if: always()
+        shell: bash
+        env:
+          CHECKOUT_RESULT: ${{ steps.checkout.outcome || 'not_run' }}
+          LOCATE_RESULT: ${{ steps.locate_project.outcome || 'not_run' }}
+          JAVA_RESULT: ${{ steps.java_setup.outcome || 'not_run' }}
+          ANDROID_RESULT: ${{ steps.android_setup.outcome || 'not_run' }}
+          SDK_RESULT: ${{ steps.sdk_install.outcome || 'not_run' }}
+          GODOT_DOWNLOAD_RESULT: ${{ steps.godot_download.outcome || 'not_run' }}
+          GODOT_CONFIG_RESULT: ${{ steps.godot_config.outcome || 'not_run' }}
+          STATIC_RESULT: ${{ steps.static_checks.outcome || 'not_run' }}
+          IMPORT_RESULT: ${{ steps.godot_import.outcome || 'not_run' }}
+          TEST_RESULT: ${{ steps.gameplay_tests.outcome || 'not_run' }}
+          EXPORT_RESULT: ${{ steps.apk_export.outcome || 'not_run' }}
+          APK_ARTIFACT_RESULT: ${{ steps.apk_artifact.outcome || 'not_run' }}
+        run: |
+          set -u
+          mkdir -p build/reports
+          REPORT='build/reports/BUILD_REPORT.md'
+          overall='SUCCESS'
+          first_failure='None'
+          declare -a labels=(
+            'Checkout source' 'Locate Godot project' 'Set up JDK 17' 'Set up Android SDK tools'
+            'Install Android SDK packages' 'Download Godot and export templates'
+            'Configure Godot Android paths' 'Static source validation'
+            'Godot import/editor validation' 'Gameplay and data tests'
+            'Export and validate APK' 'Upload APK artifact'
+          )
+          declare -a results=(
+            "$CHECKOUT_RESULT" "$LOCATE_RESULT" "$JAVA_RESULT" "$ANDROID_RESULT" "$SDK_RESULT"
+            "$GODOT_DOWNLOAD_RESULT" "$GODOT_CONFIG_RESULT" "$STATIC_RESULT"
+            "$IMPORT_RESULT" "$TEST_RESULT" "$EXPORT_RESULT" "$APK_ARTIFACT_RESULT"
+          )
+          warnings=''
+          for i in "${!results[@]}"; do
+            if [[ ( "${labels[$i]}" == 'Gameplay and data tests' || "${labels[$i]}" == 'Static source validation' ) && "${results[$i]}" == 'failure' ]]; then
+              warnings="${warnings:+$warnings; }${labels[$i]} failed or skipped (non-blocking) - see build-console.log"
+              continue
+            fi
+            if [[ "${results[$i]}" == 'failure' || "${results[$i]}" == 'cancelled' ]]; then
+              overall='FAILED'
+              if [[ "$first_failure" == 'None' ]]; then first_failure="${labels[$i]} (${results[$i]})"; fi
+            fi
+          done
+
+          {
+            echo '# BlockVerse Android APK — Build Report'
+            echo
+            echo "- **Result:** $overall"
+            echo "- **First failed step:** $first_failure"
+            echo "- **Warnings:** ${warnings:-None}"
+            echo "- **Repository:** ${GITHUB_REPOSITORY:-unknown}"
+            echo "- **Branch/ref:** ${GITHUB_REF_NAME:-unknown} (${GITHUB_REF:-unknown})"
+            echo "- **Commit:** ${GITHUB_SHA:-unknown}"
+            echo "- **Workflow run:** ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}"
+            echo "- **Godot target:** ${GODOT_VERSION:-unknown}"
+            echo "- **Runner:** ${RUNNER_OS:-unknown} / ${RUNNER_ARCH:-unknown}"
+            echo
+            echo '## Step results'
+            echo '| Step | Result |'
+            echo '|---|---|'
+            for i in "${!results[@]}"; do
+              printf '| %s | `%s` |\n' "${labels[$i]}" "${results[$i]}"
+            done
+            echo
+            echo '## Error lines detected in console log'
+            echo 'These are candidate error messages extracted automatically from shell-step logs in `build-console.log`. GitHub-managed `uses:` steps (such as the Android setup action) write their detailed output to the Actions run page rather than this shell log; open the run URL above and expand the first failed step for its original error.'
+            echo
+            echo '```text'
+            if [[ -s build-console.log ]]; then
+              grep -Ein 'error:|\bERROR\b|\bfatal\b|\bfailed\b|\bfailure\b|exception|not found|could not|cannot|invalid|timed out|permission denied|curl: \(' build-console.log | tail -n 100 || echo 'No common error pattern found. Inspect the full log and failed step above.'
+            else
+              echo 'No shell command log was produced. Check the failed action step in the GitHub Actions UI (for example checkout or setup action).'
+            fi
+            echo '```'
+            echo
+            if [[ "$overall" == 'SUCCESS' ]]; then
+              echo 'APK export and artifact upload steps reported success. Download `BlockVerse-Realistic-Android-APK` from the run summary.'
+            else
+              echo 'The APK was not confirmed as successfully created. Fix the first failed step above, then rerun the workflow. Shell-step output is included in the diagnostics artifact; for a failed GitHub-managed action step, open the workflow run URL above and expand that step to see the original action log.'
+            fi
+          } > "$REPORT"
+
+          echo '=== Build report ==='
+          cat "$REPORT"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload build report and diagnostics (always)
+        id: diagnostics_artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: BlockVerse-Build-Report-and-Logs
+          path: |
+            build/reports/BUILD_REPORT.md
+            build-console.log
+            godot-import.log
+            godot-editor-check.log
+            godot-tests.log
+            godot-export.log
+            apk-files.log
+            apk-entry-list.txt
+            apk-application-id.log
+          if-no-files-found: warn
+          retention-days: 14
